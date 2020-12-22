@@ -1,0 +1,10 @@
+name: shiny
+title:
+username:
+account: movie-recommendation
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 3401284
+bundleId: 3990161
+url: https://movie-recommendation.shinyapps.io/shiny/
+when: 1608000856.52948
