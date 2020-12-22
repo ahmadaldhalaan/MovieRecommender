@@ -1,0 +1,262 @@
+---
+title: "Movie Recommendation - Systems"
+author: "Ahmad Al-Dhalaan"
+date: "12/14/2020"
+output: html_document
+---
+
+```{r, echo=FALSE, message=FALSE}
+library(tidyverse)
+library(recommenderlab)
+library(Matrix)
+set.seed(9295)
+```
+
+# System I: recommendation based on genres
+
+## Preprocessing
+
+We begin by loading the MovieLens 1M Dataset, including the movies list and its related ratings dataset. We merge the two datasets to form one table. The table has 1,000,209 observations. Each observation represents a user's movie rating. Features include the user's id, the movie's id, user's rating of the movie, the movie's title and the movie's genre. The movies have at least one genre, with some movies having up to 6 genres.
+
+```{r}
+# load the movies.dat table
+myurl = "https://liangfgithub.github.io/MovieData/"
+movies = readLines(paste0(myurl, 'movies.dat?raw=true'))
+movies = strsplit(movies, split = "::", fixed = TRUE, useBytes = TRUE)
+movies = matrix(unlist(movies), ncol = 3, byrow = TRUE)
+movies = data.frame(movies, stringsAsFactors = FALSE)
+colnames(movies) = c('MovieID', 'Title', 'Genres')
+movies$MovieID <- as.integer(movies$MovieID)
+
+# load the ratings.dat table
+ratings = read.csv(paste0(myurl, 'ratings.dat?raw=true'), 
+                   sep = ':',
+                   colClasses = c('integer', 'NULL'), 
+                   header = FALSE)
+colnames(ratings) = c('UserID', 'MovieID', 'Rating', 'Timestamp')
+ratings$Timestamp = NULL
+
+# merge the two tables
+rankings <- ratings %>% left_join(movies, by = "MovieID")
+```
+
+Extracting the unique genre names, we observe that there are 18 genres for the user to choose from. Also, extracting unique user IDs and movie IDs, we observe that there are 6040 users and 3706 movies in our dataset. Finally, we note that the mean number of rating per movie is 270. There are 114 movies with just one rating and one movie that has 3428 ratings, which is the most-rated movie in the dataset. 
+
+```{r}
+# get genre names = 18 genres
+genres <- unique(unlist(strsplit(rankings$Genres, split = "|", fixed = TRUE)))
+
+length(unique(rankings$UserID)) #6040 users
+length(unique(rankings$MovieID)) #3706 movies
+
+# find the mean ratings per movie = 270
+ratings_dist <- rankings %>% count(MovieID)
+mean(ratings_dist$n)
+sum(ratings_dist$n == 1) # number of movies with one rating
+max(ratings_dist$n) # number of rating for most rated movie
+```
+## First recommendation system
+
+To recommend movies based on the user's genre choice, we propose using the IMDB Top 250 method of generating a "top 10" movie list. While IMDB does not disclose their current formula, they have stated that they use a weighted mean in order to generate a movie's rating. Previously, IMDB had used a Bayesian posterior mean formula to generate a movie's rating. We propose this revised formula:
+
+$W = \frac{R . v + C . m}{v+m}$
+
+where:
+
+$W = \text{weighted rating}$  
+$R = \text{average for the movie as a number from 1 to 5}$  
+$v = \text{number of votes for the movie}$  
+$m = \text{minimum votes required to be listed (60)}$  
+$C = \text{the mean vote across the whole genre}$
+
+This formula is referred to as the "credibility formula" as it attempts to provide a more credible rating by giving more weight to movies that have a higher number of ratings. We set the minimum votes required for credibility as 60, which represents 1% of users. Therefore, movies which have been rated by less than 1% of users will be cutoff from the ranking.
+
+Below we demonstrate this method for the "Drama" genre. We filter the dataset for movies which have the "Drama" genre. We then calculate and set the forumla's parameters and compute the weighted mean. Finally, we find the top 10 movies based on the weighted mean and save the movie title and weighted rating.
+
+```{r, message=FALSE}
+genre = "Drama"
+
+# filter for movies with the chosen genre
+genre_rankings <- filter(rankings, grepl(genre, Genres))   
+
+# calculate parameters  
+C <- mean(genre_rankings$Rating)
+R <- genre_rankings %>% group_by(MovieID) %>% summarise(mean_rating = mean(Rating))
+v <- genre_rankings %>% group_by(MovieID) %>% summarise(n = n())
+m <- 60 # 1% of users
+
+# find weighted rating and bind with movie id  
+W <- data.frame(cbind(R$MovieID, (R$mean_rating*v$n + C*m) / (v$n+m)))
+colnames(W) <- c("MovieID","Rating")
+
+# find top 10 rated movies  
+top_10 <- top_n(W, 10, Rating)
+
+# create output
+genre_recom <- top_10 %>% 
+  inner_join(genre_rankings, by = "MovieID") %>% 
+  distinct(Title, Rating.x) %>%
+  rename(Rating = Rating.x) %>%
+  arrange(-Rating)
+
+genre_recom$Rating <- round(genre_recom$Rating, 2)
+
+knitr::kable(genre_recom)
+```
+## Second recommendation system
+
+One issue we face with the above credibility formula is that while we are giving higher weights to movies that have been rated the most, we are not giving weights to users. A user that has rated just one movie has the same effect on ratings as a user who has rated many movies. For example, in the top 10 list above, a user who has rated only "Casablana" and perhaps has only seen that movie from the list, has the same effect as a user who has seen and rated all ten movies above. Therefore, we need to give weights to users to cutoff "inactive" users. Indeed, IMDB uses such a tactic, where they designate some users as "regular" and only use their ratings in calculating the weighted average for the Top 250 list (IMDB does not disclose how they classify users as regular).
+
+Since we do not have any user features, the only metric we can use to define a "regular" user would be their number of votes. The below boxplot shows the distribution of ratings for the movie dataset. We see that user rating activity is heavily skewed right, with many outliers with more than 500 ratings. 
+
+```{r}
+boxplot(ratings_dist$n,
+        main="Spread of movie rating per user",
+        xlab="Number of movies rated",
+        horizontal = TRUE)
+
+median(ratings_dist$n) ## median number of movies rated per user
+```
+
+Using the median (124 ratings) as a cutoff point, we remove all users who have rated less than 124 movies. Therefore, we consider users who rate 124 or more movies as regular users. We use the same credibility formula above and demonstrate it with the "Drama" genre below.
+
+```{r, message=FALSE}
+# count number of ratings per user
+ratings_dist <- rankings %>% count(UserID)
+# select regular users
+rankings <- subset(ratings_dist, n>=124, select = UserID) %>% 
+  inner_join(rankings, by = "UserID")
+
+genre = "Drama"
+
+# filter for movies with the chosen genre
+genre_rankings <- filter(rankings, grepl(genre, Genres))   
+
+# calculate parameters  
+C <- mean(genre_rankings$Rating)
+R <- genre_rankings %>% group_by(MovieID) %>% summarise(mean_rating = mean(Rating))
+v <- genre_rankings %>% group_by(MovieID) %>% summarise(n = n())
+m <- 60 # 1% of users
+
+# find weighted rating and bind with movie id  
+W <- data.frame(cbind(R$MovieID, (R$mean_rating*v$n + C*m) / (v$n+m)))
+colnames(W) <- c("MovieID","Rating")
+
+# find top 10 rated movies  
+top_10 <- top_n(W, 10, Rating)
+
+# create output
+genre_recom <- top_10 %>% 
+  inner_join(genre_rankings, by = "MovieID") %>% 
+  distinct(Title, Rating.x) %>%
+  rename(Rating = Rating.x) %>%
+  arrange(-Rating)
+
+genre_recom$Rating <- round(genre_recom$Rating, 2)
+
+knitr::kable(genre_recom)
+```
+
+An interesting thing to note is that The Godfather is now the top movie in the list (up from second) and The Godfather II is seventh, whereas it was not in the top 10 list beforehand. Overall the list is very similar, but with the revised list we can further ensure the integrity of the ranking from irregular users.
+
+## System II: collaborative recommendation systems
+
+While the genre recommender system above worked well for genre filtering, a more robust recommendation system would take as input a user's preferences and recommend a movie based on such preferences. This can be acheived with collaborative recommendation systems. To begin training such systems, we create a sparse real Rating Matrix which reduces the size of the dataset, speeding computing time during training. The sparse matrix is 6040 (users) x 3706 (movies) with 1,000,209 ratings.
+
+```{r}
+i = paste0('u', ratings$UserID)
+j = paste0('m', ratings$MovieID)
+x = ratings$Rating
+tmp = data.frame(i, j, x, stringsAsFactors = T)
+Rmat = sparseMatrix(as.integer(tmp$i), as.integer(tmp$j), x = tmp$x)
+rownames(Rmat) = levels(tmp$i)
+colnames(Rmat) = levels(tmp$j)
+Rmat = new('realRatingMatrix', data = Rmat)
+
+Rmat
+```
+
+## User-Based Collaborative Filter
+
+We will investigate two collaborative recommendation systems. The first is a user-based collaborative filter (UBCF), which predicts based on aggregated ratings from the nearest neighbors. This type of recommendation system assumes that users who rate a collection of movies similarly, have the same movie preferences. Therefore, in UBCF the system defines nearest neighbors based on users' similarity in ratings. 
+
+To evaluate UBCF on our system we evaluate its prediction performance, over 10 iterations. In each iteration, we create a training and cross-validation split of the dataset, train a recommender system on the training data and record the RMSE on the validation dataset.
+
+We use a 80/20 split to form the training and cross-validation dataset, witholding randomly chosen items using the Given-10 protocol. This protocol randomly selects 10 votes from each user as the observed votes, and then attempts to predict the remaining votes. We set a goodRating of 4 to indicate that ratings of 4 or above are considered positive in the evaluation. We then build the recommender model using the training set, center normalizing and using the cosine similarity method with 25 nearest neighbors. For unknown ratings, the model computes the average of available ratings from the 25 closest users (using the cosine similarity). 
+
+```{r}
+rmse_ubcf = matrix(, nrow = 10, ncol = 1)
+
+for (i in 1:10){
+  e <- evaluationScheme(Rmat, method="split", train=0.8, given=10, goodRating=4)
+
+  model_ubcf <- Recommender(getData(e, "train"), method = "UBCF",
+                            param=list(normalize = "center", method="Cosine", nn=25))
+
+  prediction <- predict(model_ubcf, getData(e, "known"), type="ratings")
+
+  rmse_ubcf[i] <- calcPredictionAccuracy(prediction, getData(e, "unknown"))[1]
+}
+```
+
+We note a mean RMSE of `r mean(rmse_ubcf)` with the smallest RMSE being `r min(rmse_ubcf)`.
+
+```{r}
+results = data.frame(Iteration = c(1,2,3,4,5,6,7,8,9,10),
+                     RMSE = rmse_ubcf)
+colnames(results) = c("Iteration", "RMSE")
+knitr::kable(results, caption = "RMSE for ten iterations", alignt = "ll")
+```
+Finally, we train a recommender model on the entire dataset and save the model to use for predictions:
+
+```{r}
+model_ubcf <- Recommender(Rmat, method = "UBCF",
+                            param=list(normalize = "center", method="Cosine", nn=25))
+
+saveRDS(model_ubcf, file = "model_ubcf.rds")
+```
+
+## Item-Based Collaborative Filter
+
+The second collaborative recommendation system is the item-based collaborative filter (IBCF). This system measures similarity between items (movies), assuming that a user will give a higher rating to movies that are similar to other movies he rated highly, and vice versa. Therefore, in IBCF the system defines nearest neighbors based on movies' similarity in ratings.
+
+To evaluate IBCF on our system we evaluate its prediction performance, over 10 iterations. In each iteration, we create a training and cross-validation split of the dataset, train a recommender system on the training data and record the RMSE on the validation dataset.
+
+We follow the same evaluation method that we performed for the UBCF algorith above. We use a 80/20 split to form the training and cross-validation dataset, witholding randomly chosen items using the Given-10 protocol. This protocol randomly selects 10 votes from each user as the observed votes, and then attempts to predict the remaining votes. We set a goodRating of 4 to indicate that ratings of 4 or above are considered positive in the evaluation. We then build the recommender model using the training set, center normalizing and using the cosine similarity method with 25 nearest neighbors. For unknown ratings, the model computes the average of available ratings from the 25 closest users (using the cosine similarity).
+
+```{r}
+rmse_ibcf = matrix(, nrow = 10, ncol = 1)
+
+for (i in 1:10){
+  e <- evaluationScheme(Rmat, method="split", train=0.8, given=10, goodRating=4)
+
+  model_ibcf <- Recommender(getData(e, "train"), method = "IBCF", 
+                     param=list(normalize = "center", method="Cosine", k=25))
+
+  prediction <- predict(model_ibcf, getData(e, "known"), type="ratings")
+
+  rmse_ibcf[i] <- calcPredictionAccuracy(prediction, getData(e, "unknown"))[1]
+}
+```
+
+We note a mean RMSE of `r mean(rmse_ibcf)` with the smallest RMSE being `r min(rmse_ibcf)`.
+
+```{r}
+results = data.frame(Iteration = c(1,2,3,4,5,6,7,8,9,10),
+                     RMSE = rmse_ibcf)
+colnames(results) = c("Iteration", "RMSE")
+knitr::kable(results, caption = "RMSE for ten iterations", alignt = "ll")
+```
+
+Finally, we train a recommender model on the entire dataset and save the model to use for predictions:
+
+```{r}
+model_ibcf <- Recommender(Rmat, method = "IBCF",
+                            param=list(normalize = "center", method="Cosine", k=25))
+
+saveRDS(model_ibcf, file = "model_ibcf.rds")
+```
+
+### Conclusion
+
+We presented two types of recommender systems in this report. The first filtered based on genre using a combination of weighted ratings and movie and user filtering. This method proved robust and produced recommendations that fit our expectations. In fact, our top 10 list had four movies that are in IMDB's top 10. The second method used collaborative filtering, where we found user-based systems produced smaller RMSE results for all ten iterations. User-based methods were also faster to train and predict and should be used in movie recommender applications in place of iterm-based systems. However, both methods had very slow predictions and could be prohibitive for large-scale applications. Manipulating the data by converting it to a sparse matrix and taking a given number of items for evaluation would improve performance.
